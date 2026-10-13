@@ -185,7 +185,16 @@ func extractTextContent(msg *waProto.Message) string {
 		return extendedText.GetText()
 	}
 
-	// For now, we're ignoring non-text messages
+	// The text under a photo, video or document is its caption
+	if img := msg.GetImageMessage(); img != nil {
+		return img.GetCaption()
+	} else if vid := msg.GetVideoMessage(); vid != nil {
+		return vid.GetCaption()
+	} else if doc := msg.GetDocumentMessage(); doc != nil {
+		return doc.GetCaption()
+	} else if wrapped := msg.GetDocumentWithCaptionMessage(); wrapped != nil {
+		return extractTextContent(wrapped.GetMessage())
+	}
 	return ""
 }
 
@@ -203,7 +212,7 @@ type SendMessageRequest struct {
 }
 
 // Function to send a WhatsApp message
-func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message string, mediaPath string) (bool, string) {
+func sendWhatsAppMessage(client *whatsmeow.Client, messageStore *MessageStore, recipient string, message string, mediaPath string) (bool, string) {
 	if !client.IsConnected() {
 		return false, "Not connected to WhatsApp"
 	}
@@ -362,13 +371,55 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 	}
 
 	// Send message
-	_, err = client.SendMessage(context.Background(), recipientJID, msg)
+	resp, err := client.SendMessage(context.Background(), recipientJID, msg)
 
 	if err != nil {
 		return false, fmt.Sprintf("Error sending message: %v", err)
 	}
 
+	// WhatsApp doesn't echo a message back to the device that sent it, so
+	// record it now, or it won't show in Claude or the dashboard.
+	storeSentMessage(client, messageStore, recipientJID, msg, resp, mediaPath)
+
 	return true, fmt.Sprintf("Message sent to %s", recipient)
+}
+
+// storeSentMessage saves a message this bridge just sent, and a copy of any
+// file it attached, the same way handleMessage saves incoming ones.
+func storeSentMessage(client *whatsmeow.Client, messageStore *MessageStore, chat types.JID, msg *waProto.Message, resp whatsmeow.SendResponse, mediaPath string) {
+	chatJID := chat.String()
+	name := GetChatName(client, messageStore, chat, chatJID, nil, "", waLog.Noop)
+	if err := messageStore.StoreChat(chatJID, name, resp.Timestamp); err != nil {
+		fmt.Printf("Failed to store chat for sent message: %v\n", err)
+	}
+	mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength := extractMediaInfo(msg)
+	if mediaType != "" {
+		filename = mediaFilename(mediaType, filename, resp.Timestamp, resp.ID)
+	}
+	sender := ""
+	if client.Store.ID != nil {
+		sender = client.Store.ID.User
+	}
+	if err := messageStore.StoreMessage(resp.ID, chatJID, sender, extractTextContent(msg), resp.Timestamp, true,
+		mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength); err != nil {
+		fmt.Printf("Failed to store sent message: %v\n", err)
+		return
+	}
+	if mediaType != "" && mediaPath != "" {
+		chatDir := fmt.Sprintf("store/%s", strings.ReplaceAll(chatJID, ":", "_"))
+		if data, err := os.ReadFile(mediaPath); err == nil && os.MkdirAll(chatDir, 0755) == nil {
+			_ = os.WriteFile(fmt.Sprintf("%s/%s", chatDir, filename), data, 0644)
+		}
+	}
+}
+
+// mediaFilename names a saved media file uniquely by time and message ID.
+// Documents keep the sender's (cleaned) file name at the end.
+func mediaFilename(mediaType, original string, ts time.Time, id string) string {
+	if mediaType == "document" {
+		return fmt.Sprintf("document_%s_%s_%s", ts.Format("20060102_150405"), safeFilePart(id), safeFileName(original))
+	}
+	return fmt.Sprintf("%s_%s_%s%s", mediaType, ts.Format("20060102_150405"), safeFilePart(id), filepath.Ext(original))
 }
 
 // Extract media info from a message
@@ -411,11 +462,31 @@ func extractMediaInfo(msg *waProto.Message) (mediaType string, filename string, 
 // Handle regular incoming messages with media support
 func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *events.Message, logger waLog.Logger) {
 	// Save message to database
-	chatJID := msg.Info.Chat.String()
-	sender := msg.Info.Sender.User
+	chatJIDObj := msg.Info.Chat
+	senderJIDObj := msg.Info.Sender
+
+	// WhatsApp is migrating to addressing users by LID instead of phone number.
+	// Resolve LIDs back to phone-number JIDs so messages land in the same
+	// chat/contact that the phone-number-based history sync created, rather
+	// than spawning a separate unnamed "@lid" chat.
+	if !msg.Info.IsGroup && chatJIDObj.Server == types.HiddenUserServer {
+		if pn, err := client.Store.LIDs.GetPNForLID(context.Background(), chatJIDObj); err == nil && !pn.IsEmpty() {
+			chatJIDObj = pn
+		}
+	}
+	if senderJIDObj.Server == types.HiddenUserServer {
+		if !msg.Info.SenderAlt.IsEmpty() {
+			senderJIDObj = msg.Info.SenderAlt
+		} else if pn, err := client.Store.LIDs.GetPNForLID(context.Background(), senderJIDObj); err == nil && !pn.IsEmpty() {
+			senderJIDObj = pn
+		}
+	}
+
+	chatJID := chatJIDObj.String()
+	sender := senderJIDObj.User
 
 	// Get appropriate chat name (pass nil for conversation since we don't have one for regular messages)
-	name := GetChatName(client, messageStore, msg.Info.Chat, chatJID, nil, sender, logger)
+	name := GetChatName(client, messageStore, chatJIDObj, chatJID, nil, sender, logger)
 
 	// Update chat in database with the message timestamp (keeps last message time updated)
 	err := messageStore.StoreChat(chatJID, name, msg.Info.Timestamp)
@@ -432,6 +503,14 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 	// Skip if there's no content and no media
 	if content == "" && mediaType == "" {
 		return
+	}
+
+	// extractMediaInfo names files by the current second, so two photos in the
+	// same second would share a file. Name live media by message ID instead.
+	// Documents keep the sender's file name so they're recognisable, made
+	// safe (it could contain "../") by mediaFilename.
+	if mediaType != "" {
+		filename = mediaFilename(mediaType, filename, msg.Info.Timestamp, msg.Info.ID)
 	}
 
 	// Store message in database
@@ -467,7 +546,83 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 		} else if content != "" {
 			fmt.Printf("[%s] %s %s: %s\n", timestamp, direction, sender, content)
 		}
+
+		// Save all media (photos, videos, voice notes, documents) to
+		// store/<chat>/ straight away, in the background so a large file
+		// doesn't hold up other messages.
+		// Contacts' Status updates (status@broadcast) aren't chats: skip them.
+		if mediaType != "" && chatJIDObj != types.StatusBroadcastJID {
+			go autoDownloadMedia(client, msg.Message, chatJID, filename, logger)
+		}
 	}
+}
+
+// autoDownloadMedia saves a new message's media to store/<chat>/<filename>,
+// the same place downloadMedia (and the download API) looks, using the full
+// media details in the live message rather than the ones rebuilt from the database.
+func autoDownloadMedia(client *whatsmeow.Client, m *waProto.Message, chatJID, filename string, logger waLog.Logger) {
+	var media whatsmeow.DownloadableMessage
+	if img := m.GetImageMessage(); img != nil {
+		media = img
+	} else if vid := m.GetVideoMessage(); vid != nil {
+		media = vid
+	} else if aud := m.GetAudioMessage(); aud != nil {
+		media = aud
+	} else if doc := m.GetDocumentMessage(); doc != nil {
+		media = doc
+	} else {
+		return
+	}
+	chatDir := fmt.Sprintf("store/%s", strings.ReplaceAll(chatJID, ":", "_"))
+	localPath := fmt.Sprintf("%s/%s", chatDir, filename)
+	if _, err := os.Stat(localPath); err == nil {
+		return // already saved
+	}
+	data, err := client.Download(context.Background(), media)
+	if err != nil {
+		logger.Warnf("Auto-download of %s failed: %v", filename, err)
+		return
+	}
+	if err := os.MkdirAll(chatDir, 0755); err != nil {
+		logger.Warnf("Auto-download of %s failed: %v", filename, err)
+		return
+	}
+	if err := os.WriteFile(localPath, data, 0644); err != nil {
+		logger.Warnf("Auto-download of %s failed: %v", filename, err)
+		return
+	}
+	fmt.Printf("Saved %s (%d bytes)\n", localPath, len(data))
+}
+
+// safeFileName makes a sender-supplied file name safe to save: no folders,
+// no control or reserved characters, and not too long.
+func safeFileName(name string) string {
+	name = filepath.Base(strings.ReplaceAll(name, "\\", "/"))
+	name = strings.Map(func(r rune) rune {
+		if r < 32 || strings.ContainsRune(`/\:*?"<>|`, r) {
+			return -1
+		}
+		return r
+	}, name)
+	name = strings.TrimLeft(strings.TrimSpace(name), ".")
+	if name == "" {
+		return "file"
+	}
+	if r := []rune(name); len(r) > 120 {
+		ext := filepath.Ext(name)
+		name = string(r[:120-len([]rune(ext))]) + ext
+	}
+	return name
+}
+
+// safeFilePart keeps only characters that are safe in a filename.
+func safeFilePart(s string) string {
+	return strings.Map(func(r rune) rune {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '-' || r == '_' {
+			return r
+		}
+		return -1
+	}, s)
 }
 
 // DownloadMediaRequest represents the request body for the download media API
@@ -590,7 +745,9 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 		return false, "", "", "", fmt.Errorf("failed to create chat directory: %v", err)
 	}
 
-	// Generate a local path for the file
+	// Generate a local path for the file. Document names come from the
+	// sender, so never let one point outside the chat's folder.
+	filename = safeFileName(filename)
 	localPath = fmt.Sprintf("%s/%s", chatDir, filename)
 
 	// Get absolute path
@@ -630,8 +787,9 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 		return false, "", "", "", fmt.Errorf("unsupported media type: %s", mediaType)
 	}
 
+	// Leave URL empty so whatsmeow goes through WhatsApp's media hosts with the
+	// signed direct path; fetching the stored mmg URL directly now returns 403.
 	downloader := &MediaDownloader{
-		URL:           url,
 		DirectPath:    directPath,
 		MediaKey:      mediaKey,
 		FileLength:    fileLength,
@@ -641,7 +799,7 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 	}
 
 	// Download the media using whatsmeow client
-	mediaData, err := client.Download(downloader)
+	mediaData, err := client.Download(context.Background(), downloader)
 	if err != nil {
 		return false, "", "", "", fmt.Errorf("failed to download media: %v", err)
 	}
@@ -666,13 +824,9 @@ func extractDirectPathFromURL(url string) string {
 		return url // Return original URL if parsing fails
 	}
 
-	pathPart := parts[1]
-
-	// Remove query parameters
-	pathPart = strings.SplitN(pathPart, "?", 2)[0]
-
-	// Create proper direct path format
-	return "/" + pathPart
+	// Keep the query string: its oh/oe parameters sign the request, and
+	// WhatsApp refuses the download without them.
+	return "/" + parts[1]
 }
 
 // Start a REST API server to expose the WhatsApp client functionality
@@ -706,7 +860,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		fmt.Println("Received request to send message", req.Message, req.MediaPath)
 
 		// Send the message
-		success, message := sendWhatsAppMessage(client, req.Recipient, req.Message, req.MediaPath)
+		success, message := sendWhatsAppMessage(client, messageStore, req.Recipient, req.Message, req.MediaPath)
 		fmt.Println("Message sent", success, message)
 		// Set response headers
 		w.Header().Set("Content-Type", "application/json")
@@ -800,14 +954,14 @@ func main() {
 		return
 	}
 
-	container, err := sqlstore.New("sqlite3", "file:store/whatsapp.db?_foreign_keys=on", dbLog)
+	container, err := sqlstore.New(context.Background(), "sqlite3", "file:store/whatsapp.db?_foreign_keys=on", dbLog)
 	if err != nil {
 		logger.Errorf("Failed to connect to database: %v", err)
 		return
 	}
 
 	// Get device store - This contains session information
-	deviceStore, err := container.GetFirstDevice()
+	deviceStore, err := container.GetFirstDevice(context.Background())
 	if err != nil {
 		if err == sql.ErrNoRows {
 			// No device exists, create one
@@ -973,7 +1127,7 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 
 		// If we didn't get a name, try group info
 		if name == "" {
-			groupInfo, err := client.GetGroupInfo(jid)
+			groupInfo, err := client.GetGroupInfo(context.Background(), jid)
 			if err == nil && groupInfo.Name != "" {
 				name = groupInfo.Name
 			} else {
@@ -988,7 +1142,7 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 		logger.Infof("Getting name for contact: %s", chatJID)
 
 		// Just use contact info (full name)
-		contact, err := client.Store.Contacts.GetContact(jid)
+		contact, err := client.Store.Contacts.GetContact(context.Background(), jid)
 		if err == nil && contact.FullName != "" {
 			name = contact.FullName
 		} else if sender != "" {
@@ -1056,11 +1210,7 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 				// Extract text content
 				var content string
 				if msg.Message.Message != nil {
-					if conv := msg.Message.Message.GetConversation(); conv != "" {
-						content = conv
-					} else if ext := msg.Message.Message.GetExtendedTextMessage(); ext != nil {
-						content = ext.GetText()
-					}
+					content = extractTextContent(msg.Message.Message) // includes captions
 				}
 
 				// Extract media info

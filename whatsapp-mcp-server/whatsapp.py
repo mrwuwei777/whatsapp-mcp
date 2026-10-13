@@ -52,32 +52,23 @@ def get_sender_name(sender_jid: str) -> str:
         conn = sqlite3.connect(MESSAGES_DB_PATH)
         cursor = conn.cursor()
         
-        # First try matching by exact JID
+        # sender is stored as a bare phone number, so match it (or a JID built
+        # from it) directly. The match is anchored to the start of the JID and
+        # excludes groups so it can't collide with a group JID that happens to
+        # start with the same digits (group JIDs are "<creatorNumber>-<ts>@g.us").
+        if '@' in sender_jid:
+            phone_part = sender_jid.split('@')[0]
+        else:
+            phone_part = sender_jid
+
         cursor.execute("""
             SELECT name
             FROM chats
-            WHERE jid = ?
+            WHERE (jid = ? OR jid LIKE ?) AND jid NOT LIKE '%@g.us'
             LIMIT 1
-        """, (sender_jid,))
-        
+        """, (sender_jid, f"{phone_part}@%"))
+
         result = cursor.fetchone()
-        
-        # If no result, try looking for the number within JIDs
-        if not result:
-            # Extract the phone number part if it's a JID
-            if '@' in sender_jid:
-                phone_part = sender_jid.split('@')[0]
-            else:
-                phone_part = sender_jid
-                
-            cursor.execute("""
-                SELECT name
-                FROM chats
-                WHERE jid LIKE ?
-                LIMIT 1
-            """, (f"%{phone_part}%",))
-            
-            result = cursor.fetchone()
         
         if result and result[0]:
             return result[0]
